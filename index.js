@@ -195,6 +195,7 @@ async function connectToWhatsApp() {
         // Read dynamic config on each message (served from cache)
         const apiKey   = await config.get('gemini_api_key', 'GEMINI_API_KEY', '');
         const targetGroups = await config.getList('target_group_ids', 'TARGET_GROUP_ID');
+        const incomeGroups = await config.getList('income_group_ids', 'INCOME_GROUP_ID');
 
         const from       = msg.key.remoteJid;
         const isGroup    = from.endsWith('@g.us');
@@ -305,7 +306,7 @@ async function connectToWhatsApp() {
             logger.info(`USDT check skipped/failed: ${usdtErr.message}`);
           }
 
-          if (usdtData && usdtData.amountUsdt) {
+          if (usdtData && usdtData.isUsdtReceipt && usdtData.amountUsdt) {
             logger.info(`USDT Receipt detected! Amount: ${usdtData.amountUsdt} USDT | Rate: ${usdtData.rateEgp || 'N/A'} EGP`);
 
             if (!usdtData.rateEgp) {
@@ -396,14 +397,24 @@ async function connectToWhatsApp() {
 
           logger.success(`Account matched: ${account.owner_name} (Balance: ${account.current_balance} EGP)`);
 
+          // Determine transaction direction (income vs expense)
+          const isIncomeGroup = incomeGroups.includes(from);
+          const txType = isIncomeGroup ? 'income' : 'expense';
+
+          logger.info(`Recording transaction direction as: ${txType} (isIncomeGroup: ${isIncomeGroup})`);
+
           // Record transaction
-          await db.recordExpenseTransaction(receiptData, account.id, senderJid);
+          await db.recordTransaction(receiptData, account.id, senderJid, txType);
 
           // Success reply
+          const defaultTemplate = isIncomeGroup
+            ? '✅ *تم تسجيل معاملة إيداع (داخل) بنجاح!*\n━━━━━━━━━━━━━━━━━━\n👤 *الحساب:* {account_name}\n💵 *المبلغ:* {amount} ج.م (إيداع/داخل)\n🏦 *المحفظة:* {wallet_number}\nℹ️ *المرسل:* {recipient_name}\n🆔 *الرقم المرجعي:* {reference_id}\n━━━━━━━━━━━━━━━━━━\n💰 تم زيادة رصيد الحساب تلقائياً.'
+            : '✅ *تم تسجيل المعاملة تلقائياً بنجاح!*\n━━━━━━━━━━━━━━━━━━\n👤 *الحساب:* {account_name}\n💵 *المبلغ:* {amount} ج.م (صرف/خارج)\n🏦 *المحفظة:* {wallet_number}\nℹ️ *المرسل إليه:* {recipient_name}\n🆔 *الرقم المرجعي:* {reference_id}\n━━━━━━━━━━━━━━━━━━\n💰 تم تحديث الرصيد وحساب الحدود تلقائياً.';
+
+          const templateKey = isIncomeGroup ? 'msg_income_success_template' : 'msg_success_template';
+
           const successMsg = config.format(
-            config.getSync('msg_success_template', null,
-              '✅ *تم تسجيل المعاملة تلقائياً بنجاح!*\n━━━━━━━━━━━━━━━━━━\n👤 *الحساب:* {account_name}\n💵 *المبلغ:* {amount} ج.م (صرف)\n🏦 *المحفظة:* {wallet_number}\nℹ️ *المرسل إليه:* {recipient_name}\n🆔 *الرقم المرجعي:* {reference_id}\n━━━━━━━━━━━━━━━━━━\n💰 تم تحديث الرصيد وحساب الحدود تلقائياً.'
-            ),
+            config.getSync(templateKey, null, defaultTemplate),
             {
               account_name:   account.owner_name,
               amount:         receiptData.amount,
@@ -414,7 +425,7 @@ async function connectToWhatsApp() {
           );
 
           await sock.sendMessage(from, { text: successMsg, quoted: msg });
-          logger.success('Transaction recorded and reply sent.');
+          logger.success(`Transaction (${txType}) recorded and reply sent.`);
 
         } catch (err) {
           logger.error('Error processing group message/image:', err);
