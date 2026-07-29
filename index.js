@@ -14,6 +14,7 @@ import dotenv from 'dotenv';
 import { logger } from './lib/logger.js';
 import { extractReceiptData } from './lib/receiptExtractor.js';
 import { extractOrderData } from './lib/orderExtractor.js';
+import { extractUsdtData, parseRateFromCaption } from './lib/usdtExtractor.js';
 import { config } from './lib/configService.js';
 import * as db from './lib/supabaseService.js';
 
@@ -292,10 +293,63 @@ async function connectToWhatsApp() {
           }
 
           const mimeType = imageMsg.mimetype || 'image/jpeg';
-          logger.success(`Image downloaded successfully (${(buffer.length / 1024).toFixed(1)} KB)`);
+          const captionText = imageMsg.caption || '';
+          logger.success(`Image downloaded successfully (${(buffer.length / 1024).toFixed(1)} KB) | Caption: "${captionText}"`);
 
-          // OCR via Gemini
-          logger.info('Sending image to Gemini for payment receipt analysis...');
+          // ── 1. Check for USDT Receipt ──────────────────────────
+          logger.info('Analyzing image with Gemini for USDT transaction & rate...');
+          let usdtData = null;
+          try {
+            usdtData = await extractUsdtData(buffer, mimeType, captionText, apiKey);
+          } catch (usdtErr) {
+            logger.info(`USDT check skipped/failed: ${usdtErr.message}`);
+          }
+
+          if (usdtData && usdtData.amountUsdt) {
+            logger.info(`USDT Receipt detected! Amount: ${usdtData.amountUsdt} USDT | Rate: ${usdtData.rateEgp || 'N/A'} EGP`);
+
+            if (!usdtData.rateEgp) {
+              logger.warn('USDT detected but exchange rate (EGP/USDT) is missing from caption.');
+              const noRateMsg = `⚠️ *تنبيه معاملة USDT:*\nتم استخراج المبلغ (${usdtData.amountUsdt} USDT)، ولكن لم يتبين سعر الصرف بالجنيه أسفل الصورة.\nيرجى كتابة السعر أسفل الصورة (مثال: 52 أو 52.5ج أو 52 جنيه).`;
+              await sock.sendMessage(from, { text: noRateMsg, quoted: msg });
+              continue;
+            }
+
+            // Duplicate check for USDT
+            if (usdtData.referenceId) {
+              const isDup = await db.checkDuplicateUsdt(usdtData.referenceId);
+              if (isDup) {
+                logger.warn(`Duplicate USDT transaction detected: ${usdtData.referenceId}`);
+                const dupMsg = `⚠️ *تنبيه:* معاملة USDT ذات الرقم المرجعي (${usdtData.referenceId}) مسجلة مسبقاً في النظام.`;
+                await sock.sendMessage(from, { text: dupMsg, quoted: msg });
+                continue;
+              }
+            }
+
+            // Save USDT transaction to DB
+            await db.insertUsdtTransaction(usdtData, senderJid);
+
+            // Send WhatsApp confirmation
+            const usdtSuccessMsg = config.format(
+              config.getSync('msg_usdt_success_template', null,
+                '✅ *تم تسجيل معاملة USDT بنجاح!*\n━━━━━━━━━━━━━━━━━━\n💵 *المبلغ:* {amount_usdt} USDT\n💱 *سعر الصرف:* {rate_egp} ج.م / USDT\n💰 *الإجمالي بالمصري:* {total_egp} ج.م\n👤 *المستلم:* {recipient_name}\n🆔 *الرقم المرجعي:* {reference_id}\n━━━━━━━━━━━━━━━━━━\nتم تسجيل المعاملة وحساب إجمالي التحويل بنجاح.'
+              ),
+              {
+                amount_usdt:    usdtData.amountUsdt,
+                rate_egp:       usdtData.rateEgp,
+                total_egp:      usdtData.totalEgp?.toLocaleString('ar-EG') || usdtData.totalEgp,
+                recipient_name: usdtData.recipientName || 'غير متوفر',
+                reference_id:   usdtData.referenceId   || 'غير متوفر',
+              }
+            );
+
+            await sock.sendMessage(from, { text: usdtSuccessMsg, quoted: msg });
+            logger.success('USDT Transaction recorded and reply sent.');
+            continue;
+          }
+
+          // ── 2. Standard E-Wallet / Bank Receipt Processing ────
+          logger.info('Sending image to Gemini for standard payment receipt analysis...');
           const receiptData = await extractReceiptData(buffer, mimeType, apiKey);
 
           // OCR failed
