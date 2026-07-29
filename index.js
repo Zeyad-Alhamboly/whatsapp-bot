@@ -2,7 +2,9 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
-  getContentType
+  getContentType,
+  fetchLatestBaileysVersion,
+  Browsers
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
@@ -91,12 +93,15 @@ async function connectToWhatsApp() {
 
   const waLogger = pino({ level: 'warn' });
 
-  const botName = await config.get('bot_name', null, 'Hefny Bot');
+  // Fetch the latest active WhatsApp Web protocol version
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  logger.info(`Using WhatsApp Web v${version.join('.')}, isLatest: ${isLatest}`);
 
   const sock = (makeWASocket.default || makeWASocket)({
+    version,
     auth: state,
     logger: waLogger,
-    browser: [botName, 'Chrome', '1.0.0'],
+    browser: Browsers.ubuntu('Chrome'),
     connectTimeoutMs: 20_000,
     keepAliveIntervalMs: 30_000,
     defaultQueryTimeoutMs: undefined,
@@ -121,6 +126,17 @@ async function connectToWhatsApp() {
       const shouldReconnect = code !== DisconnectReason.loggedOut;
 
       logger.error(`Connection closed. Code: ${code ?? 'n/a'} — ${lastDisconnect?.error?.message || 'unknown'}`);
+      
+      if (lastDisconnect) {
+        console.dir(lastDisconnect, { depth: null });
+        if (lastDisconnect.error?.output) {
+          logger.error(`Error Output: ${JSON.stringify(lastDisconnect.error.output, null, 2)}`);
+        }
+        if (lastDisconnect.error?.stack) {
+          logger.error(`Error Stack: ${lastDisconnect.error.stack}`);
+        }
+      }
+
       if (shouldReconnect) {
         logger.info('Reconnecting in 3 seconds...');
         await db.updateBotStatus('CONNECTING');
