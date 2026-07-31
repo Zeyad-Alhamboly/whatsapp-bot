@@ -15,6 +15,7 @@ import { logger } from './lib/logger.js';
 import { extractReceiptData } from './lib/receiptExtractor.js';
 import { extractOrderData } from './lib/orderExtractor.js';
 import { extractUsdtData, parseRateFromCaption } from './lib/usdtExtractor.js';
+import { extractIncomeTextData } from './lib/incomeExtractor.js';
 import { config } from './lib/configService.js';
 import * as db from './lib/supabaseService.js';
 
@@ -224,14 +225,16 @@ async function connectToWhatsApp() {
           logger.info('Copy this ID to target_group_ids in the Admin Settings page.');
         }
 
-        // Skip if not from target groups
-        if (targetGroups.length > 0 && !targetGroups.includes(from)) {
+        const isIncomeGroup = incomeGroups.includes(from);
+
+        // Skip if not from target groups or income groups
+        if (targetGroups.length > 0 && !targetGroups.includes(from) && !incomeGroups.includes(from)) {
           logger.info(`[SKIP] Message from other group (${from}), not in monitored groups. Ignoring.`);
           continue;
         }
 
-        // Validate API key
-        if (!apiKey) {
+        // Validate API key for standard non-income image/text processing
+        if (!apiKey && !isIncomeGroup) {
           logger.error('[SKIP] gemini_api_key is not configured in DB or .env. Cannot process messages.');
           continue;
         }
@@ -239,11 +242,90 @@ async function connectToWhatsApp() {
         // ── Image messages ───────────────────────────────────────
         const imageMsg = getImageMessage(msg.message);
         if (!imageMsg) {
-          // Text message — check for order
+          // Text message
           const text = msg.message?.conversation ||
                        msg.message?.extendedTextMessage?.text ||
                        '';
 
+          // ── Handle Income Group Text Messages ────────────────────
+          if (isIncomeGroup) {
+            logger.info(`[INCOME GROUP] Processing text income transaction in group (${from})...`);
+            const incomeData = extractIncomeTextData(text);
+
+            if (incomeData.isIncome && incomeData.phoneNumber && incomeData.amount) {
+              logger.info(`Extracted income transaction: Phone=${incomeData.phoneNumber} | Amount=${incomeData.amount} | Name=${incomeData.customerName || 'N/A'}`);
+
+              const account = await db.findAccountByWalletNumber(incomeData.phoneNumber);
+
+              if (!account) {
+                logger.alert(`Income wallet number ${incomeData.phoneNumber} does not match any registered account!`);
+                const failedReceipt = {
+                  amount: incomeData.amount,
+                  walletNumber: incomeData.phoneNumber,
+                  recipientNumber: incomeData.phoneNumber,
+                  recipientName: incomeData.customerName || null,
+                  provider: 'WhatsApp Text',
+                };
+                await db.logFailedAttempt(failedReceipt, 'no_account', senderJid, `Wallet number ${incomeData.phoneNumber} not registered.`);
+
+                const noAccMsg = config.format(
+                  config.getSync('msg_no_account', null, '❌ *خطأ في تسجيل المعاملة:*\nرقم المحفظة ({wallet_number}) غير مسجل في النظام البنكي.\nالمبلغ: {amount} ج.م\nالرجاء إضافة الحساب أولاً أو مراجعة الرقم.'),
+                  { wallet_number: incomeData.phoneNumber, amount: incomeData.amount }
+                );
+                await sock.sendMessage(from, { text: noAccMsg, quoted: msg });
+                await sendAlert(sock, `Income wallet number (${incomeData.phoneNumber}) unmatched! Amount: ${incomeData.amount} EGP`);
+                continue;
+              }
+
+              logger.success(`Account matched for income: ${account.owner_name} (Current Balance: ${account.current_balance} EGP)`);
+
+              const receiptData = {
+                amount: incomeData.amount,
+                walletNumber: incomeData.phoneNumber,
+                recipientNumber: incomeData.phoneNumber,
+                recipientName: incomeData.customerName || account.owner_name,
+                provider: 'WhatsApp Text',
+                referenceId: `TXT-INC-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                date: new Date().toISOString().substring(0, 10),
+              };
+
+              // Record transaction (type = 'income' automatically increases account current_balance in DB)
+              await db.recordTransaction(receiptData, account.id, senderJid, 'income');
+
+              const successTemplate = config.getSync(
+                'msg_income_text_success_template',
+                null,
+                '✅ *تم تسجيل معاملة إيداع (داخل) بنجاح!*\n━━━━━━━━━━━━━━━━━━\n👤 *الحساب:* {account_name}\n💵 *المبلغ:* {amount} ج.م (إيداع/داخل)\n🏦 *المحفظة:* {wallet_number}\n{customer_info}━━━━━━━━━━━━━━━━━━\n💰 تم زيادة رصيد الحساب تلقائياً.'
+              );
+
+              const successMsg = config.format(successTemplate, {
+                account_name: account.owner_name,
+                amount: incomeData.amount,
+                wallet_number: incomeData.phoneNumber,
+                customer_info: incomeData.customerName ? `ℹ️ *اسم العميل:* ${incomeData.customerName}\n` : '',
+              });
+
+              await sock.sendMessage(from, { text: successMsg, quoted: msg });
+              logger.success(`Income transaction recorded and reply sent for phone ${incomeData.phoneNumber}.`);
+
+            } else {
+              // Message in income group is missing required phone or amount
+              const hasDigits = /\d/.test(text);
+              if (hasDigits || text.length > 3) {
+                logger.warn(`Income message format incomplete: "${text}"`);
+                const invalidMsg = config.getSync(
+                  'msg_income_invalid_format',
+                  null,
+                  '⚠️ *صيغة معاملة الإيداع غير مكتملة:*\nيرجى إرسال المعاملة بالاسطمبات التالية:\n\n[اسم العميل - اختياري]\n[رقم التليفون]\n[المبلغ]\n\nمثال:\nاحمد\n01097245962\n5000\n\nأو:\n01097245962\n5000'
+                );
+                await sock.sendMessage(from, { text: invalidMsg, quoted: msg });
+              }
+            }
+
+            continue; // Finish processing for income group
+          }
+
+          // ── Handle Standard Group Orders (Text) ──────────────────
           const hasPhone = /(?:\+2|002|2)?01[0125]\d{8}/.test(text);
 
           if (hasPhone) {
@@ -278,6 +360,17 @@ async function connectToWhatsApp() {
         }
 
         // ── Image processing ─────────────────────────────────────
+        if (isIncomeGroup) {
+          logger.info(`[INCOME GROUP] Image received in income group (${from}). Image processing disabled for income group.`);
+          const textNotice = config.getSync(
+            'msg_income_image_disabled',
+            null,
+            '⚠️ *تنبيه:* تم إلغاء التعامل بالسكرين شوت في جروب "الداخل".\nيرجى إرسال المعاملة كرسالة نصية بالاسطمبة التالية:\n\n[اسم العميل - اختياري]\nرقم التليفون\nالمبلغ\n\nمثال:\nاحمد\n01097245962\n5000'
+          );
+          await sock.sendMessage(from, { text: textNotice, quoted: msg });
+          continue;
+        }
+
         logger.info(`Received image in group from: ${msg.pushName || senderJid.split('@')[0]}`);
 
         try {
