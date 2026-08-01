@@ -499,21 +499,28 @@ async function connectToWhatsApp() {
           // Record transaction
           await db.recordTransaction(receiptData, account.id, senderJid, txType);
 
+          // Get updated account balance after transaction
+          const updatedAccount = await db.findAccountByWalletNumber(receiptData.walletNumber);
+          const remainingBalance = (updatedAccount && updatedAccount.current_balance !== undefined)
+            ? updatedAccount.current_balance
+            : (Number(account.current_balance || 0) - Number(receiptData.amount || 0));
+
           // Success reply
           const defaultTemplate = isIncomeGroup
             ? '✅ *تم تسجيل معاملة إيداع (داخل) بنجاح!*\n━━━━━━━━━━━━━━━━━━\n👤 *الحساب:* {account_name}\n💵 *المبلغ:* {amount} ج.م (إيداع/داخل)\n🏦 *المحفظة:* {wallet_number}\nℹ️ *المرسل:* {recipient_name}\n🆔 *الرقم المرجعي:* {reference_id}\n━━━━━━━━━━━━━━━━━━\n💰 تم زيادة رصيد الحساب تلقائياً.'
-            : '✅ *تم تسجيل المعاملة تلقائياً بنجاح!*\n━━━━━━━━━━━━━━━━━━\n👤 *الحساب:* {account_name}\n💵 *المبلغ:* {amount} ج.م (صرف/خارج)\n🏦 *المحفظة:* {wallet_number}\nℹ️ *المرسل إليه:* {recipient_name}\n🆔 *الرقم المرجعي:* {reference_id}\n━━━━━━━━━━━━━━━━━━\n💰 تم تحديث الرصيد وحساب الحدود تلقائياً.';
+            : '✅ *تم تسجيل المعاملة تلقائياً بنجاح!*\n━━━━━━━━━━━━━━━━━━\n👤 *الحساب:* {account_name}\n💵 *المبلغ:* {amount} ج.م (صرف/خارج)\n🏦 *المحفظة:* {wallet_number}\n💳 *الرصيد المتبقي:* {remaining_balance} ج.م\nℹ️ *المرسل إليه:* {recipient_name}\n🆔 *الرقم المرجعي:* {reference_id}\n━━━━━━━━━━━━━━━━━━\n💰 تم تحديث الرصيد وحساب الحدود تلقائياً.';
 
           const templateKey = isIncomeGroup ? 'msg_income_success_template' : 'msg_success_template';
 
           const successMsg = config.format(
             config.getSync(templateKey, null, defaultTemplate),
             {
-              account_name:   account.owner_name,
-              amount:         receiptData.amount,
-              wallet_number:  receiptData.walletNumber,
-              recipient_name: receiptData.recipientName || 'غير متوفر',
-              reference_id:   receiptData.referenceId  || 'غير متوفر',
+              account_name:      account.owner_name,
+              amount:            receiptData.amount,
+              wallet_number:     receiptData.walletNumber,
+              remaining_balance: remainingBalance,
+              recipient_name:    receiptData.recipientName || 'غير متوفر',
+              reference_id:      receiptData.referenceId  || 'غير متوفر',
             }
           );
 
