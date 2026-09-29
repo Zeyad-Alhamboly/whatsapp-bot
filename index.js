@@ -390,16 +390,13 @@ async function connectToWhatsApp() {
           const captionText = imageMsg.caption || '';
           logger.success(`Image downloaded successfully (${(buffer.length / 1024).toFixed(1)} KB) | Caption: "${captionText}"`);
 
-          // ── 1. Check for USDT Receipt ──────────────────────────
-          logger.info('Analyzing image with Gemini for USDT transaction & rate...');
-          let usdtData = null;
-          try {
-            usdtData = await extractUsdtData(buffer, mimeType, captionText, apiKey);
-          } catch (usdtErr) {
-            logger.info(`USDT check skipped/failed: ${usdtErr.message}`);
-          }
+          // ── Analyze image with Gemini (Unified Receipt & USDT analysis) ────
+          logger.info('Analyzing image with Gemini for transaction details...');
+          const receiptData = await extractReceiptData(buffer, mimeType, apiKey, captionText);
 
-          if (usdtData && usdtData.isUsdtReceipt && usdtData.amountUsdt) {
+          // ── 1. Handle USDT Receipt ──────────────────────────
+          if (receiptData && receiptData.isUsdtReceipt && receiptData.amountUsdt) {
+            const usdtData = receiptData;
             logger.info(`USDT Receipt detected! Amount: ${usdtData.amountUsdt} USDT | Rate: ${usdtData.rateEgp || 'N/A'} EGP`);
 
             if (!usdtData.rateEgp) {
@@ -443,8 +440,6 @@ async function connectToWhatsApp() {
           }
 
           // ── 2. Standard E-Wallet / Bank Receipt Processing ────
-          logger.info('Sending image to Gemini for standard payment receipt analysis...');
-          const receiptData = await extractReceiptData(buffer, mimeType, apiKey);
 
           // OCR failed
           if (!receiptData.amount || !receiptData.walletNumber) {
