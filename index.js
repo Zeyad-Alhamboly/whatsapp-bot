@@ -441,8 +441,20 @@ async function connectToWhatsApp() {
 
           // ── 2. Standard E-Wallet / Bank Receipt Processing ────
 
-          // OCR failed
-          if (!receiptData.amount || !receiptData.walletNumber) {
+          // Pre-recovery: if walletNumber is missing from image, check if caption contains a phone number
+          if (!receiptData.walletNumber && captionText) {
+            const normalizedCaption = captionText
+              .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+              .replace(/[\s\-()]/g, '');
+            const captionMatch = normalizedCaption.match(/(?:\+?20|002)?(01[0125]\d{8})/);
+            if (captionMatch) {
+              receiptData.walletNumber = captionMatch[1];
+              logger.info(`Extracted walletNumber from caption: ${receiptData.walletNumber}`);
+            }
+          }
+
+          // OCR failed (missing amount or any phone number at all)
+          if (!receiptData.amount || (!receiptData.walletNumber && !receiptData.recipientNumber)) {
             logger.warn(`OCR incomplete — amount=${receiptData.amount} | wallet=${receiptData.walletNumber}`);
             await db.logFailedAttempt(receiptData, 'ocr_failed', senderJid, 'Failed to extract amount or wallet number from the receipt');
             await sendAlert(sock, `Failed to parse receipt from ${msg.pushName || senderJid.split('@')[0]} - could not extract amount or wallet number.`, from);
@@ -466,20 +478,55 @@ async function connectToWhatsApp() {
             }
           }
 
-          // Account lookup
-          logger.info(`Searching database for account matching wallet number: ${receiptData.walletNumber}`);
-          const account = await db.findAccountByWalletNumber(receiptData.walletNumber);
+          // Account lookup with Smart Auto-Recovery
+          logger.info(`Searching database for account matching wallet number: ${receiptData.walletNumber || 'N/A'}`);
+          let account = receiptData.walletNumber
+            ? await db.findAccountByWalletNumber(receiptData.walletNumber)
+            : null;
+
+          // Smart Recovery 1: If walletNumber is missing or unmatched, check if recipientNumber is a registered account (swapped fields)
+          if (!account && receiptData.recipientNumber) {
+            const recipientAccount = await db.findAccountByWalletNumber(receiptData.recipientNumber);
+            if (recipientAccount) {
+              logger.warn(`Wallet (${receiptData.walletNumber || 'N/A'}) unmatched, but recipientNumber (${receiptData.recipientNumber}) matched registered account (${recipientAccount.owner_name}). Auto-swapping!`);
+              const oldWallet = receiptData.walletNumber;
+              receiptData.walletNumber = receiptData.recipientNumber;
+              receiptData.recipientNumber = oldWallet || null;
+              account = recipientAccount;
+            }
+          }
+
+          // Smart Recovery 2: If still unmatched, scan caption for any registered account number
+          if (!account && captionText) {
+            const normalizedCaption = captionText
+              .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+              .replace(/[\s\-()]/g, '');
+            const matches = normalizedCaption.match(/(?:\+?20|002)?(01[0125]\d{8})/g) || [];
+            for (const rawMatch of matches) {
+              const localMatch = rawMatch.match(/(01[0125]\d{8})$/);
+              if (localMatch) {
+                const captionAccount = await db.findAccountByWalletNumber(localMatch[1]);
+                if (captionAccount) {
+                  logger.info(`Smart Recovery: matched account (${captionAccount.owner_name}) from caption: ${localMatch[1]}`);
+                  receiptData.walletNumber = localMatch[1];
+                  account = captionAccount;
+                  break;
+                }
+              }
+            }
+          }
 
           if (!account) {
-            logger.alert(`Wallet number ${receiptData.walletNumber} does not match any registered account!`);
-            await db.logFailedAttempt(receiptData, 'no_account', senderJid, `Wallet number ${receiptData.walletNumber} not registered.`);
+            const displayWallet = receiptData.walletNumber || 'غير محدد في الصورة';
+            logger.alert(`Wallet number ${displayWallet} does not match any registered account!`);
+            await db.logFailedAttempt(receiptData, 'no_account', senderJid, `Wallet number ${displayWallet} not registered.`);
 
             const noAccMsg = config.format(
               config.getSync('msg_no_account', null, '❌ *خطأ في تسجيل المعاملة:*\nرقم المحفظة ({wallet_number}) غير مسجل في النظام البنكي.\nالمبلغ: {amount} ج.م\nالرجاء إضافة الحساب أولاً أو مراجعة الرقم.'),
-              { wallet_number: receiptData.walletNumber, amount: receiptData.amount }
+              { wallet_number: displayWallet, amount: receiptData.amount }
             );
             await sock.sendMessage(from, { text: noAccMsg, quoted: msg });
-            await sendAlert(sock, `Wallet number (${receiptData.walletNumber}) unmatched! Amount: ${receiptData.amount} EGP`);
+            await sendAlert(sock, `Wallet number (${displayWallet}) unmatched! Amount: ${receiptData.amount} EGP`);
             continue;
           }
 
